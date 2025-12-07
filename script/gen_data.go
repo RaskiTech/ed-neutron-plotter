@@ -30,11 +30,12 @@ func main() {
 	scanner := bufio.NewScanner(f)
 	scanner.Scan()
 
-	outfiles := make([]*os.File, 0)
+	outfiles := make([]*bufio.Writer, 0)
 	for i := range 4 {
 		filename := fmt.Sprintf("public/neutron_coords_%d.bin", i)
 		outfile, err := os.Create(filename)
-		outfiles = append(outfiles, outfile)
+		w := bufio.NewWriter(outfile)
+		outfiles = append(outfiles, w)
 		if err != nil {
 			panic(err)
 		}
@@ -42,7 +43,7 @@ func main() {
 
 	defer func() {
 		for _, outfile := range outfiles {
-			outfile.Close()
+			outfile.Flush()
 		}
 	}()
 
@@ -64,7 +65,7 @@ func main() {
 			fmt.Println(string(line))
 			panic(err)
 		}
-		data[0] = sys.Coords.X
+		data[0] = -sys.Coords.X
 		data[1] = sys.Coords.Y
 		data[2] = sys.Coords.Z
 

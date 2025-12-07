@@ -2,6 +2,8 @@ import { float, Fn, uniform, vec4, color, instancedArray } from 'three/tsl';
 import './style.css'
 import * as THREE from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/Addons.js';
+import { SearchBox } from './search';
+import { api } from './api';
 
 let camera = new THREE.PerspectiveCamera(25, window.innerWidth / window.innerHeight, 0.1, 200);
 
@@ -43,6 +45,29 @@ async function main() {
   await loadStars()
 
   render()
+
+  const searchBox = new SearchBox({
+    placeholder: "Search stars..",
+    onSearch: async (query: string) => {
+      const target = await api.getStarCoords(query)
+      controls.target = target
+      controls.update()
+    }
+  })
+
+  searchBox.mount(document.body)
+
+  const cubeTextureLoader = new THREE.CubeTextureLoader();
+  const texture = await cubeTextureLoader.loadAsync([
+    '/skybox/front.png',
+    '/skybox/back.png',
+    '/skybox/top.png',
+    '/skybox/bottom.png',
+    '/skybox/left.png',
+    '/skybox/right.png',
+  ])
+
+  scene.background = texture;
 }
 
 function onWindowResize() {
