@@ -24,4 +24,4 @@ dist-ssr
 *.sw?
 
 systems_neutron.json
-out.bin
+*.bin

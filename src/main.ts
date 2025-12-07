@@ -2,18 +2,19 @@ import { float, Fn, uniform, vec4, color, instancedArray } from 'three/tsl';
 import './style.css'
 import * as THREE from 'three/webgpu';
 import { OrbitControls } from 'three/examples/jsm/Addons.js';
-let camera = new THREE.PerspectiveCamera(25, window.innerWidth / window.innerHeight, 0.1, 100);
+
+let camera = new THREE.PerspectiveCamera(25, window.innerWidth / window.innerHeight, 0.1, 200);
+
 let scene = new THREE.Scene();
 let renderer = new THREE.WebGPURenderer({
   antialias: true,
 });
 
 let controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0, 25)
 
 async function main() {
-  camera.position.set(3, 5, 8);
-  // camera.near = 0.05;
-  camera.far = 200
+  camera.position.set(34.65699659876029, 21.90527423256544, -24.079356892645272);
 
   // ambient light
 
@@ -78,18 +79,20 @@ async function loadStars() {
   const count = starPositionArrays.reduce((acc, arr) => acc + arr.length / 3, 0)
   console.log(`Loaded star data with ${count} stars`)
 
-  for (const arr of starPositionArrays) {
+  for (let i = 0; i < starPositionArrays.length; i++) {
+    const arr = starPositionArrays[i];
     const positionBuffer = instancedArray(arr, 'vec3');
 
     // nodes
-    const material = new THREE.SpriteNodeMaterial({ blending: THREE.AdditiveBlending, depthWrite: false });
+    const material = new THREE.SpriteNodeMaterial({ blending: THREE.AdditiveBlending, depthWrite: false, depthTest: false });
     const colorA = uniform(color('#5900ff'));
 
     material.positionNode = positionBuffer.toAttribute().div(float(1000));
 
+    // const colors = [vec3(1, 0, 0), vec3(0, 1, 0), vec3(0, 0, 1), vec3(1, 1, 1)]
+
     material.colorNode = Fn(() => {
       return vec4(colorA, 1);
-
     })();
 
     material.scaleNode = float(0.05);

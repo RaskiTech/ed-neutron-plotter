@@ -47,8 +47,10 @@ func main() {
 	}()
 
 	data := []float32{0, 0, 0}
+	// for range 100000 {
 	for scanner.Scan() {
 		var sys System
+		// scanner.Scan()
 		line := scanner.Bytes()
 		if line[len(line)-1] == ']' {
 			break
@@ -70,7 +72,7 @@ func main() {
 		if sys.Coords.X > 0 {
 			i += 2
 		}
-		if sys.Coords.Y > 0 {
+		if sys.Coords.Z > 25000 {
 			i += 1
 		}
 
