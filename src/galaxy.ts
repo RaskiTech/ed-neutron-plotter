@@ -1,8 +1,8 @@
 import { OrbitControls } from 'three/examples/jsm/Addons.js';
 import { Inspector } from 'three/examples/jsm/inspector/Inspector.js';
 import Stats from 'three/examples/jsm/libs/stats.module.js';
-import { color, cos, float, Fn, instancedArray, sin, uniform, vec4 } from 'three/tsl';
-import { AdditiveBlending, Box3, Box3Helper, BoxHelper, CubeTextureLoader, InstancedMesh, PerspectiveCamera, PlaneGeometry, Scene, Sphere, SpriteNodeMaterial, Vector3, WebGPURenderer } from 'three/webgpu';
+import { color, cos, float, Fn, instancedArray, instancedBufferAttribute, sin, uniform, vec4 } from 'three/tsl';
+import { AdditiveBlending, Box3, Box3Helper, BoxHelper, BufferAttribute, BufferGeometry, CubeTextureLoader, InstancedMesh, Mesh, PerspectiveCamera, PlaneGeometry, Points, PointsNodeMaterial, Scene, Sphere, SphereGeometry, SpriteNodeMaterial, Vector3, WebGPURenderer } from 'three/webgpu';
 
 
 export class Galaxy {
@@ -17,8 +17,10 @@ export class Galaxy {
   targetPosition = new Vector3(0, 0, 0)
   currentPosition = this.targetPosition.clone()
 
+  focusSphere!: Mesh
+
   stats = new Stats()
-  
+
   async init() {
     this.camera.position.set(34.65699659876029, 21.90527423256544, -24.079356892645272);
 
@@ -26,7 +28,7 @@ export class Galaxy {
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.renderer.setClearColor('#000000');
     document.body.appendChild(this.renderer.domElement);
-    
+
     document.body.appendChild(this.stats.dom)
 
     await this.renderer.init();
@@ -34,6 +36,7 @@ export class Galaxy {
     this.controls.enableDamping = true;
     this.controls.minDistance = 0.1;
     this.controls.maxDistance = 150;
+    this.controls.zoomSpeed = 3.0
     this.controls.update()
 
     // this is for you javascript (middle finger)
@@ -54,11 +57,26 @@ export class Galaxy {
 
     this.scene.background = texture;
 
+    this.focusSphere = this.createFocusSphere()
+    this.scene.add(this.focusSphere)
+
     this.loadStars()
+  }
+
+  createFocusSphere() {
+    const geometry = new SphereGeometry(0.001, 16, 16);
+    const material = new SpriteNodeMaterial({
+      colorNode: vec4(uniform(color('#ffffff')), float(1.0)),
+      sizeAttenuation: false,
+    })
+    const sphere = new Mesh(geometry, material)
+    sphere.position.copy(this.targetPosition)
+    return sphere
   }
 
   setTarget(target: Vector3) {
     this.targetPosition = target
+    this.focusSphere.position.copy(this.targetPosition)
     this.requestRenderIfNotRequested()
   }
 
@@ -77,7 +95,6 @@ export class Galaxy {
     this.controls.update()
     this.stats.update()
     this.renderer.render(this.scene, this.camera)
-    
 
     if (this.currentPosition.distanceToSquared(this.targetPosition) > 0.01) {
       this.currentPosition.lerp(this.targetPosition, 0.08)
@@ -96,7 +113,7 @@ export class Galaxy {
 
   async loadStars() {
     console.log('Loading star data...')
-    const starPositionArrays = await Promise.all([0, 1, 2, 3,4,5,6,7,8]
+    const starPositionArrays = await Promise.all([0, 1, 2, 3, 4, 5, 6, 7, 8]
       .map(i => fetch(`/data/neutron_stars${i}.bin`)
         .then(res => res.arrayBuffer())
         .then(arr => new DataView(arr)))
@@ -107,7 +124,7 @@ export class Galaxy {
 
     for (let i = 0; i < starPositionArrays.length; i++) {
       const arr = starPositionArrays[i];
-      
+
       let aabb_min_x = arr.getFloat32(0, true)
       let aabb_min_y = arr.getFloat32(4, true)
       let aabb_min_z = arr.getFloat32(8, true)
@@ -116,35 +133,23 @@ export class Galaxy {
       let aabb_max_y = arr.getFloat32(16, true)
       let aabb_max_z = arr.getFloat32(20, true)
       let aabb_max = new Vector3(aabb_max_x, aabb_max_y, aabb_max_z).divideScalar(1000)
-      
-      console.log(`Star array ${i}: AABB min(${aabb_min_x}, ${aabb_min_y}, ${aabb_min_z}) max(${aabb_max_x}, ${aabb_max_y}, ${aabb_max_z})`)
-      let starArr = new Float32Array(arr.buffer, 3*4)
-      const positionBuffer = instancedArray(starArr, 'vec3');
 
-      // nodes
-      const material = new SpriteNodeMaterial({ blending: AdditiveBlending, depthWrite: false, depthTest: false });
+      console.log(`Star array ${i}: AABB min(${aabb_min_x}, ${aabb_min_y}, ${aabb_min_z}) max(${aabb_max_x}, ${aabb_max_y}, ${aabb_max_z})`)
+      let starArr = new Float32Array(arr.buffer, 3 * 4)
+
+      const geometry = new BufferGeometry()
+      geometry.setAttribute('position', new BufferAttribute(starArr, 3))
+
       const colorA = uniform(color('#5900ff'));
 
-      new Vector3()
-      material.positionNode = positionBuffer.toAttribute().div(float(1000));
-
-      material.colorNode = Fn(() => {
-        let c = sin(i);
-        let c2 = cos(i);
-        return vec4(colorA, 1);
-      })();
-
-      material.scaleNode = float(0.05);
+      const material = new PointsNodeMaterial({
+        blending: AdditiveBlending,
+        depthWrite: false, depthTest: false,
+        colorNode: vec4(colorA, 1),
+      });
 
       // mesh
-      const geometry = new PlaneGeometry(0.5, 0.5);
-      const mesh = new InstancedMesh(geometry, material, starArr.length / 3);
-      mesh.boundingBox = new Box3(aabb_min, aabb_max)
-      const boundingSphere = new Sphere()
-      mesh.boundingBox.getBoundingSphere(boundingSphere)
-      mesh.boundingSphere = boundingSphere
-      // let box = new Box3Helper(mesh.boundingBox!)
-      // this.scene.add(box)
+      const mesh = new Points(geometry, material);
       mesh.frustumCulled = true
       this.scene.add(mesh);
       this.requestRenderIfNotRequested()

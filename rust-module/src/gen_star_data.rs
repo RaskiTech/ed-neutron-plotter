@@ -63,7 +63,13 @@ fn main() -> io::Result<()> {
             let line = line.as_mut_str();
             let system = unsafe { simd_json::from_str::<System>(line).unwrap() };
 
-            stars.push(Star::new(system.coords.x, system.coords.y, system.coords.z));
+            // The coordinates are in light years, three.js doesn't like such huge distances
+            // This will reduce the scale to max [-100, 100] in each axis
+            stars.push(Star::new(
+                system.coords.x / 1000.0,
+                system.coords.y / 1000.0,
+                system.coords.z / 1000.0,
+            ));
 
             trie.insert(system.name.as_str());
         });
