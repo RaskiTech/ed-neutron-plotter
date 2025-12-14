@@ -1,6 +1,31 @@
 use std::io::{self, Write};
 
-use crate::Coords;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct System {
+    // id: i64,
+    // id64: i64,
+    pub name: String,
+    pub coords: Coords,
+    // date: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Coords {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl Coords {
+    pub fn write_to_file<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        writer.write_all(&self.x.to_le_bytes())?;
+        writer.write_all(&self.y.to_le_bytes())?;
+        writer.write_all(&self.z.to_le_bytes())?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Star {

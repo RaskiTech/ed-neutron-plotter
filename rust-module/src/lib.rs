@@ -1,9 +1,10 @@
-mod trie;
-mod utils;
+pub mod star;
+pub mod trie;
+pub mod utils;
 
 use wasm_bindgen::prelude::*;
 
-use crate::trie::CompactPatriciaTrie;
+use crate::trie::CompactRadixTrie;
 
 #[wasm_bindgen]
 extern "C" {
@@ -21,7 +22,7 @@ pub fn greet() {
 
 #[wasm_bindgen]
 pub fn suggest_words(trie: &[u8], prefix: &str, num_suggestions: usize) -> Vec<JsValue> {
-    let trie = CompactPatriciaTrie::from_bytes(trie);
+    let trie = CompactRadixTrie::from_bytes(trie);
 
     trie.suggest(prefix, num_suggestions)
         .into_iter()
@@ -31,7 +32,7 @@ pub fn suggest_words(trie: &[u8], prefix: &str, num_suggestions: usize) -> Vec<J
 
 #[wasm_bindgen]
 pub fn contains(trie: &[u8], prefix: &str) -> JsValue {
-    let trie = CompactPatriciaTrie::from_bytes(trie);
+    let trie = CompactRadixTrie::from_bytes(trie);
 
     JsValue::from_bool(trie.contains(prefix))
 }

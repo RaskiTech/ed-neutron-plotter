@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "gen_star_data"
-path = "src/gen_star_data.rs"
+path = "src/bin/gen_star_data.rs"
 
 [features]
 default = ["console_error_panic_hook"]

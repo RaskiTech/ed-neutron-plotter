@@ -1,204 +1,343 @@
-use std::{io::Read, mem};
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::TryInto,
+    mem,
+};
 
-use byteorder::{LittleEndian, ReadBytesExt};
-use rayon::prelude::*;
+/// Sentinel for CompactNode (23 bits)
+const COMPACT_NONE: u32 = 0x007FFFFF;
 
-/// A sentinel value representing "null" or "no node".
-/// Must fit in 24 bits for the packed next_sibling field.
-const NONE: u32 = 0x00FFFFFF; // 16,777,215 - maximum value for 24 bits
-
-/// A compact node representation (16 bytes total).
+/// A compact node representation (8 bytes).
+/// Optimized for space and cache locality.
 ///
 /// Layout:
-/// Each node uses 12 bytes:
 /// - label_start (4 bytes)
-/// - first_child (4 bytes)
-/// - next_sibling_packed (4 bytes):
-///   - next_sibling: bits 0-23 (24 bits, max 16M nodes)
-///   - label_len: bits 24-30 (7 bits, max 127 chars)
-///   - is_terminal: bit 31 (1 bit)
+/// - packed (4 bytes):
+///   - first_child: 23 bits (8M nodes max)
+///   - label_len: 7 bits (127 chars max)
+///   - is_terminal: 1 bit
+///   - has_next_sibling: 1 bit
 #[derive(Clone, Copy, Debug)]
-#[repr(C)] // Ensures consistent memory layout for WASM/FFI
-pub struct Node {
+#[repr(C)]
+pub struct CompactNode {
     pub label_start: u32,
-    pub first_child: u32,
-    // Packed field: next_sibling (24 bits) | label_len (7 bits) | is_terminal (1 bit)
-    pub next_sibling_packed: u32,
+    pub packed: u32,
 }
 
-impl Node {
-    // Helper functions for packed next_sibling field
-
-    pub fn next_sibling(&self) -> u32 {
-        self.next_sibling_packed & 0x00FFFFFF // First 24 bits
+impl CompactNode {
+    pub fn first_child(&self) -> u32 {
+        self.packed & 0x007FFFFF
     }
 
     pub fn label_len(&self) -> u16 {
-        ((self.next_sibling_packed >> 24) & 0x7F) as u16 // Bits 24-30 (7 bits)
+        ((self.packed >> 23) & 0x7F) as u16
     }
 
     pub fn is_terminal(&self) -> bool {
-        (self.next_sibling_packed >> 31) != 0 // Bit 31
+        ((self.packed >> 30) & 1) != 0
     }
 
-    pub fn set_next_sibling(&mut self, next_sibling: u32) {
-        // Validate that next_sibling fits in 24 bits
-        debug_assert!(
-            next_sibling <= 0x00FFFFFF,
-            "next_sibling {} exceeds 24-bit limit",
-            next_sibling
-        );
-        // Clear the next_sibling bits and set new value
-        self.next_sibling_packed =
-            (self.next_sibling_packed & 0xFF000000) | (next_sibling & 0x00FFFFFF);
-    }
-
-    pub fn set_label_len(&mut self, label_len: u16) {
-        // Validate that label_len fits in 7 bits
-        debug_assert!(
-            label_len <= 127,
-            "label_len {} exceeds 7-bit limit",
-            label_len
-        );
-        // Clear the label_len bits and set new value
-        self.next_sibling_packed =
-            (self.next_sibling_packed & 0x80FFFFFF) | ((label_len as u32 & 0x7F) << 24);
-    }
-
-    pub fn set_is_terminal(&mut self, is_terminal: bool) {
-        // Clear the is_terminal bit and set new value
-        self.next_sibling_packed =
-            (self.next_sibling_packed & 0x7FFFFFFF) | ((is_terminal as u32) << 31);
+    pub fn has_next_sibling(&self) -> bool {
+        ((self.packed >> 31) & 1) != 0
     }
 
     pub fn new(
         label_start: u32,
         first_child: u32,
-        next_sibling: u32,
         label_len: u16,
         is_terminal: bool,
+        has_next_sibling: bool,
     ) -> Self {
-        let mut node = Node {
+        debug_assert!(first_child <= 0x007FFFFF, "first_child index too large");
+        debug_assert!(label_len <= 127, "label_len too large");
+
+        let packed = (first_child & 0x007FFFFF)
+            | ((label_len as u32 & 0x7F) << 23)
+            | ((is_terminal as u32) << 30)
+            | ((has_next_sibling as u32) << 31);
+
+        CompactNode {
             label_start,
-            first_child,
-            next_sibling_packed: 0,
-        };
-        node.set_next_sibling(next_sibling);
-        node.set_label_len(label_len);
-        node.set_is_terminal(is_terminal);
-        node
+            packed,
+        }
+    }
+}
+#[derive(Debug, Default)]
+struct Node {
+    // The string segment associated with the edge leading to this node
+    prefix: String,
+    // Use HashMap to index children by their first character
+    children: HashMap<char, Node>,
+    // Marks if a word ends at this exact node
+    is_leaf: bool,
+}
+
+impl Node {
+    fn new(prefix: String, is_leaf: bool) -> Self {
+        Self {
+            prefix,
+            is_leaf,
+            children: HashMap::new(),
+        }
     }
 }
 
-/// A linear-memory Patricia Trie.
-///
-/// It consists of two vectors:
-/// 1. `nodes`: The structural data.
-/// 2. `labels`: A massive append-only byte array storing string fragments.
-pub struct CompactPatriciaTrie {
-    pub nodes: Vec<Node>,
-    pub labels: Vec<u8>,
+#[derive(Debug, Default)]
+pub struct TrieBuilder {
+    root: Node,
 }
 
-impl CompactPatriciaTrie {
+impl TrieBuilder {
     pub fn new() -> Self {
-        let mut trie = Self {
-            nodes: vec![],
-            labels: vec![],
-        };
-        // Create a dummy root node.
-        // The root has no label and is not terminal.
-        trie.nodes.push(Node::new(0, NONE, NONE, 0, false));
-        trie
+        Self {
+            root: Node::new(String::from(""), false),
+        }
     }
 
-    /// Inserts a string into the trie.
-    pub fn insert(&mut self, key: &str) {
-        let key_bytes = key.as_bytes();
-        let mut node_idx = 0; // Start at root
-        let mut key_cursor = 0;
+    pub fn insert(&mut self, word: &str) {
+        let mut current_node = &mut self.root;
+        let mut remaining_key = word;
 
-        // Traverse down the tree
-        'outer: while key_cursor < key_bytes.len() {
-            // We need to look at the children of the current node
-            let mut child_idx = self.nodes[node_idx].first_child;
-            let mut prev_child_idx = NONE;
+        while !remaining_key.is_empty() {
+            // 1. Look for a child that starts with the first char of our remaining key
+            let first_char = remaining_key.chars().next().unwrap();
 
-            while child_idx != NONE {
-                // Get common prefix length between the key remainder and this child's label
-                let child_label = self.get_label(child_idx);
-                let current_key_part = &key_bytes[key_cursor..];
+            if current_node.children.contains_key(&first_char) {
+                let child_node = current_node.children.get_mut(&first_char).unwrap();
+                // Calculate longest common prefix (LCP) between remaining_key and child.prefix
+                let common_len = Self::common_prefix_len(&child_node.prefix, remaining_key);
 
-                let common_len = Self::common_prefix(child_label, current_key_part);
+                // Case 2: Full Match - We traverse deeper
+                // Example: Tree has "apple", Insert "applepie" (common: "apple")
+                if common_len == child_node.prefix.len() {
+                    remaining_key = &remaining_key[common_len..];
+                    current_node = child_node;
 
-                if common_len > 0 {
-                    // CASE 1: Partial match or Full match
+                    // If we consumed the whole key, mark this node as a word end
+                    if remaining_key.is_empty() {
+                        current_node.is_leaf = true;
+                    }
+                }
+                // Case 3: Partial Match - We need to split the existing edge
+                // Example: Tree has "apple", Insert "apply" (common: "appl")
+                else {
+                    // 3a. Split the existing child node
+                    let child_suffix = child_node.prefix[common_len..].to_string();
+                    let input_suffix = remaining_key[common_len..].to_string();
 
-                    // If the child label matches fully, but the key has more characters,
-                    // or if the child label is longer than the common match (split needed).
+                    // Truncate the current child's prefix to the common part (e.g., "apple" -> "appl")
+                    child_node.prefix.truncate(common_len);
 
-                    if common_len < child_label.len() {
-                        // SPLIT NEEDED: The child's edge is "longer" than the match.
-                        // Example: Existing="banana", Insert="ban". Common=3.
-                        // We must split "banana" into "ban" -> "ana".
-                        self.split_node(child_idx, common_len);
+                    // Create a new node for the split part of the original child (e.g., "e")
+                    // It inherits the children and leaf status of the original node
+                    let mut split_node = Node::new(child_suffix, child_node.is_leaf);
+                    split_node.children = std::mem::take(&mut child_node.children);
+
+                    // The original node is no longer a leaf (unless the new word ends exactly here)
+                    child_node.is_leaf = false;
+
+                    // Re-attach the split part
+                    let split_key = split_node.prefix.chars().next().unwrap();
+                    child_node.children.insert(split_key, split_node);
+
+                    // 3b. Insert the new word's remaining part (if any)
+                    if !input_suffix.is_empty() {
+                        let input_key = input_suffix.chars().next().unwrap();
+                        child_node
+                            .children
+                            .insert(input_key, Node::new(input_suffix, true));
+                    } else {
+                        // The inserted word ended exactly at the split point
+                        child_node.is_leaf = true;
                     }
 
-                    // Move cursor forward
-                    key_cursor += common_len;
-                    node_idx = child_idx as usize;
-                    continue 'outer;
+                    return;
                 }
-
-                // No match, move to next sibling
-                prev_child_idx = child_idx;
-                child_idx = self.nodes[child_idx as usize].next_sibling();
-            }
-
-            // CASE 2: No matching child found.
-            // We must insert a new child node with the remainder of the key.
-            let remainder = &key_bytes[key_cursor..];
-            let new_child_idx = self.create_node(remainder, true);
-
-            // Link the new node into the sibling chain
-            if prev_child_idx == NONE {
-                // It's the first child
-                self.nodes[node_idx].first_child = new_child_idx;
             } else {
-                self.nodes[prev_child_idx as usize].set_next_sibling(new_child_idx);
+                // No matching edge. Create a new one with the rest of the key.
+                current_node
+                    .children
+                    .insert(first_char, Node::new(remaining_key.to_string(), true));
+                return;
             }
-
-            return;
-        }
-
-        // If we exhausted the key exactly at this node, mark it terminal.
-        if key_cursor == key_bytes.len() {
-            self.nodes[node_idx].set_is_terminal(true);
         }
     }
 
-    /// Returns true if the exact string exists in the trie.
+    /// Converts the pointer-based RadixTree into the flat, cache-friendly CompactRadixTrie.
+    pub fn build(&self) -> (Vec<CompactNode>, Vec<u8>) {
+        let mut nodes = Vec::new();
+        let mut labels = Vec::<u8>::new();
+        let mut queue = VecDeque::new();
+
+        // 1. Process Root
+        // The root usually has an empty label. We create it first.
+        let root_label_len = self.root.prefix.len();
+        if root_label_len > 127 {
+            panic!("Label too long for compact node");
+        }
+
+        labels.extend_from_slice(self.root.prefix.as_bytes());
+
+        nodes.push(CompactNode::new(
+            0, // Root label starts at 0
+            // Initialize with NO children. We will update this later if children exist.
+            COMPACT_NONE,
+            root_label_len as u16,
+            self.root.is_leaf,
+            false,
+        ));
+
+        // Queue tuple: (index_in_compact_vec, reference_to_original_node)
+        queue.push_back((0, &self.root));
+
+        // 2. BFS Traversal
+        while let Some((parent_idx, source_node)) = queue.pop_front() {
+            if source_node.children.is_empty() {
+                continue;
+            }
+
+            // Get children and sort them to ensure deterministic sibling order
+            // (Crucial for consistent linear iteration)
+            let mut child_list: Vec<&Node> = source_node.children.values().collect();
+            child_list.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+
+            // The children will be stored contiguously starting at this index
+            let start_child_idx = nodes.len();
+
+            // Safety check for the 23-bit child index limit (8 million nodes)
+            if start_child_idx > 0x007FFFFF {
+                panic!("Trie too large: > 8M nodes");
+            }
+
+            // 3. Update Parent's "first_child" pointer
+            // We need to preserve the parent's existing flags/len, only updating the child index bits.
+            let parent_packed = nodes[parent_idx].packed;
+            // Clear the old child index (bottom 23 bits) and OR in the new index
+            nodes[parent_idx].packed = (parent_packed & !0x007FFFFF) | (start_child_idx as u32);
+
+            // 4. Process Children
+            for (i, child) in child_list.iter().enumerate() {
+                let label_len = child.prefix.len();
+                if label_len > 127 {
+                    panic!(
+                        "Label '{}' too long (max 127 bytes in compact trie)",
+                        child.prefix
+                    );
+                }
+
+                // Add label to the main byte array
+                let label_start = labels.len() as u32;
+                labels.extend_from_slice(child.prefix.as_bytes());
+
+                // Determine if this child has a subsequent sibling in the block
+                let has_next_sibling = i < child_list.len() - 1;
+
+                // Push the new compact node
+                nodes.push(CompactNode::new(
+                    label_start,
+                    COMPACT_NONE, // Placeholder, will be updated when we process this node
+                    label_len as u16,
+                    child.is_leaf,
+                    has_next_sibling,
+                ));
+
+                // Add to queue to process this child's children later
+                queue.push_back((start_child_idx + i, child));
+            }
+        }
+
+        compress_labels(&mut labels, &mut nodes);
+
+        (nodes, labels)
+    }
+
+    // Helper to find length of common prefix
+    fn common_prefix_len(s1: &str, s2: &str) -> usize {
+        s1.bytes()
+            .zip(s2.bytes())
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+}
+
+/// An immutable, space-optimized Radix Trie.
+/// Nodes are 8 bytes each (vs 12 bytes in Builder).
+pub struct CompactRadixTrie<'a> {
+    pub nodes: &'a [CompactNode],
+    pub labels: &'a [u8],
+}
+
+impl<'a> CompactRadixTrie<'a> {
+    pub fn new(nodes: &'a [CompactNode], labels: &'a [u8]) -> Self {
+        Self { nodes, labels }
+    }
+
+    pub fn from_bytes(data: &'a [u8]) -> Self {
+        let node_size = mem::size_of::<CompactNode>();
+        let node_count = u32::from_le_bytes(data[0..4].try_into().unwrap());
+
+        let nodes_start = 4;
+        let nodes_end = nodes_start + (node_count as usize * node_size);
+        let nodes_bytes = &data[nodes_start..nodes_end];
+
+        let labels_count = u32::from_le_bytes(data[nodes_end..nodes_end + 4].try_into().unwrap());
+
+        let labels_start = nodes_end + 4;
+        let labels_end = labels_start + (labels_count as usize);
+
+        let labels_bytes = &data[labels_start..labels_end];
+
+        let nodes: &[CompactNode] = unsafe {
+            std::slice::from_raw_parts(
+                nodes_bytes.as_ptr() as *const CompactNode,
+                nodes_bytes.len() / node_size,
+            )
+        };
+
+        Self {
+            nodes,
+            labels: labels_bytes,
+        }
+    }
+
+    fn get_label(&self, node_idx: u32) -> &[u8] {
+        let node = &self.nodes[node_idx as usize];
+        let start = node.label_start as usize;
+        let end = start + node.label_len() as usize;
+        &self.labels[start..end]
+    }
+
     pub fn contains(&self, key: &str) -> bool {
         let key_bytes = key.as_bytes();
         let mut node_idx = 0;
         let mut key_cursor = 0;
 
         while key_cursor < key_bytes.len() {
-            let mut child_idx = self.nodes[node_idx].first_child;
+            let mut child_idx = self.nodes[node_idx].first_child();
+
+            if child_idx == COMPACT_NONE {
+                return false;
+            }
+
             let mut matched_child = false;
 
-            while child_idx != NONE {
+            // Iterate through sequential siblings
+            loop {
                 let child_label = self.get_label(child_idx);
                 let current_key_part = &key_bytes[key_cursor..];
 
-                // For a successful search, the child label must be a prefix of the remaining key
                 if current_key_part.starts_with(child_label) {
                     key_cursor += child_label.len();
                     node_idx = child_idx as usize;
                     matched_child = true;
                     break;
                 }
-                child_idx = self.nodes[child_idx as usize].next_sibling();
+
+                if self.nodes[child_idx as usize].has_next_sibling() {
+                    child_idx += 1;
+                } else {
+                    break;
+                }
             }
 
             if !matched_child {
@@ -209,37 +348,30 @@ impl CompactPatriciaTrie {
         self.nodes[node_idx].is_terminal()
     }
 
-    /// Returns up to 6 suggestions extending the given prefix.
     pub fn suggest(&self, prefix: &str, num_suggestions: usize) -> Vec<String> {
         let mut results = Vec::new();
         let prefix_bytes = prefix.as_bytes();
         let mut node_idx = 0;
         let mut key_cursor = 0;
-        // Buffer contains the current prefix being built with correct capitalization
         let mut buffer = vec![];
 
-        // 1. Traverse to the end of the prefix
         while key_cursor < prefix_bytes.len() {
-            let mut child_idx = self.nodes[node_idx].first_child;
+            let mut child_idx = self.nodes[node_idx].first_child();
+            if child_idx == COMPACT_NONE {
+                return results;
+            }
+
             let mut found_child = false;
 
-            while child_idx != NONE {
+            loop {
                 let child_label = self.get_label(child_idx);
                 let current_key_part = &prefix_bytes[key_cursor..];
-
-                // Check how much of the prefix matches this child
-                let common_len = Self::common_prefix(child_label, current_key_part);
+                let common_len = common_prefix_len(child_label, current_key_part);
 
                 if common_len > 0 {
-                    // Match found (partial or complete)
-                    // Append the matched, correctly capitalized part to the buffer
                     buffer.extend_from_slice(&child_label[..common_len]);
-                    // If the match is partial (e.g. prefix="ba", child="banana"),
-                    // we have found our target node. We are inside this node.
+
                     if common_len == current_key_part.len() {
-                        // We consumed the whole prefix.
-                        // We are now "inside" this child node at offset `common_len`.
-                        // We start collecting from here.
                         let mut buffer = String::from_utf8(buffer).unwrap();
                         self.collect_suggestions(
                             child_idx,
@@ -251,123 +383,51 @@ impl CompactPatriciaTrie {
                         return results;
                     }
 
-                    // If we consumed the whole child label but still have prefix left
-                    // (e.g. prefix="banana", child="ban")
                     if common_len == child_label.len() {
                         key_cursor += common_len;
                         node_idx = child_idx as usize;
                         found_child = true;
-                        break; // Break inner loop, continue outer 'while' to go deeper
+                        break;
                     }
 
-                    // Mismatch: prefix has characters that don't match child
-                    // (e.g. prefix="band", child="bar") -> No results.
                     return results;
                 }
 
-                child_idx = self.nodes[child_idx as usize].next_sibling();
+                if self.nodes[child_idx as usize].has_next_sibling() {
+                    child_idx += 1;
+                } else {
+                    break;
+                }
             }
 
             if !found_child {
-                // We have remaining prefix characters but no matching child.
                 return results;
             }
         }
 
-        // If we reach here, we consumed the exact prefix and landed exactly on a node boundary.
-        // We act as if we are at the children of the current node.
-        // However, standard traversal leaves us at `node_idx`. We need to search its children.
-
-        // Corner case: The user typed exactly a string that is a node boundary.
-        // We traverse all children of the current node_idx.
-        // Note: The `node_idx` itself might be terminal, but `collect_suggestions`
-        // is designed to complete a specific node.
-
-        // We manually check if the current node (which we fully traversed) is terminal?
-        // Actually, the previous logic (insert/contains) assumes we processed the node.
-        // For suggestion, if we are exactly at a node, we just start DFS on its children.
-
         let mut buffer = String::from(prefix);
-
-        // If the exact prefix itself is a valid word (and we are at root or a boundary), add it.
-        // Note: The root is never terminal, so this check is safe.
         if self.nodes[node_idx as usize].is_terminal() {
             results.push(buffer.clone());
         }
 
-        // Start DFS on children
-        let mut child = self.nodes[node_idx as usize].first_child;
-        while child != NONE {
-            self.collect_suggestions(child, 0, &mut buffer, &mut results, num_suggestions);
-            if results.len() >= num_suggestions {
-                return results;
+        let mut child = self.nodes[node_idx as usize].first_child();
+        if child != COMPACT_NONE {
+            loop {
+                self.collect_suggestions(child, 0, &mut buffer, &mut results, num_suggestions);
+                if results.len() >= num_suggestions {
+                    return results;
+                }
+                if self.nodes[child as usize].has_next_sibling() {
+                    child += 1;
+                } else {
+                    break;
+                }
             }
-            child = self.nodes[child as usize].next_sibling();
         }
 
         results
     }
 
-    // --- Helper Methods ---
-
-    /// Creates a new node and appends its label to the label store.
-    fn create_node(&mut self, label: &[u8], is_terminal: bool) -> u32 {
-        let label_start = self.labels.len() as u32;
-        let label_len = label.len() as u16;
-
-        self.labels.extend_from_slice(label);
-
-        let idx = self.nodes.len() as u32;
-        self.nodes
-            .push(Node::new(label_start, NONE, NONE, label_len, is_terminal));
-        idx
-    }
-
-    /// Splits an edge at `split_idx` (length of prefix).
-    /// Used when an existing edge "banana" needs to become "ban" -> "ana".
-    fn split_node(&mut self, node_idx: u32, split_len: usize) {
-        let node_label_start = self.nodes[node_idx as usize].label_start;
-        let node_label_len = self.nodes[node_idx as usize].label_len();
-
-        // 1. Create a new node representing the suffix ("ana")
-        // NOTE: We don't need to copy bytes to `labels`. We can point to the existing
-        // bytes in `labels` just offset by `split_len`.
-        let suffix_start = node_label_start + split_len as u32;
-        let suffix_len = node_label_len - split_len as u16;
-
-        let new_child_idx = self.nodes.len() as u32;
-
-        // The new child inherits the children and terminal status of the original node
-        let original_children = self.nodes[node_idx as usize].first_child;
-        let original_terminal = self.nodes[node_idx as usize].is_terminal();
-
-        self.nodes.push(Node::new(
-            suffix_start,
-            original_children, // Takes custody of existing children
-            NONE,              // It will be the only child of the parent (for now)
-            suffix_len,
-            original_terminal,
-        ));
-
-        // 2. Update the original node to represent the prefix ("ban")
-        // It now points to the new child.
-        let node = &mut self.nodes[node_idx as usize];
-        node.set_label_len(split_len as u16);
-        node.first_child = new_child_idx;
-        node.set_is_terminal(false); // "ban" is likely not terminal unless explicitly marked later
-    }
-
-    fn get_label(&self, node_idx: u32) -> &[u8] {
-        let node = &self.nodes[node_idx as usize];
-        let start = node.label_start as usize;
-        let end = start + node.label_len() as usize;
-        &self.labels[start..end]
-    }
-    /// Recursive helper to collect suggestions.
-    ///
-    /// `node_idx`: The node we are currently visiting.
-    /// `offset`: How many bytes of this node's label we have already "matched" or "skipped".
-    ///           (Used when the user's prefix ended in the middle of this node's label).
     pub fn collect_suggestions(
         &self,
         node_idx: u32,
@@ -382,282 +442,188 @@ impl CompactPatriciaTrie {
 
         let node = &self.nodes[node_idx as usize];
         let full_label = self.get_label(node_idx);
-
-        // Append the *remainder* of the label (part we haven't typed yet)
         let remainder = &full_label[offset..];
-
-        // Safety: We assume labels are valid UTF-8 since inputs are &str.
-        // In a raw bytes trie, you'd handle this differently.
         let remainder_str = unsafe { std::str::from_utf8_unchecked(remainder) };
-
         let added_len = remainder_str.len();
         buffer.push_str(remainder_str);
 
-        // 1. Is this node itself a valid word?
         if node.is_terminal() {
             results.push(buffer.clone());
-            if results.len() >= 6 {
-                // Backtrack before returning
-                buffer.truncate(buffer.len() - added_len);
-                return;
-            }
-        }
-
-        // 2. DFS into children
-        let mut child = node.first_child;
-        while child != NONE {
-            self.collect_suggestions(child, 0, buffer, results, num_suggestions);
             if results.len() >= num_suggestions {
                 buffer.truncate(buffer.len() - added_len);
                 return;
             }
-            child = self.nodes[child as usize].next_sibling();
         }
 
-        // Backtrack
+        let mut child = node.first_child();
+        if child != COMPACT_NONE {
+            loop {
+                self.collect_suggestions(child, 0, buffer, results, num_suggestions);
+                if results.len() >= num_suggestions {
+                    buffer.truncate(buffer.len() - added_len);
+                    return;
+                }
+                if self.nodes[child as usize].has_next_sibling() {
+                    child += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
         buffer.truncate(buffer.len() - added_len);
     }
 
-    /// Memory usage estimation in bytes
     pub fn size_in_bytes(&self) -> usize {
-        (self.nodes.len() * mem::size_of::<Node>()) + (self.labels.len())
-    }
-
-    /// Helper to find the length of the common prefix between two byte slices.
-    fn common_prefix(a: &[u8], b: &[u8]) -> usize {
-        a.iter()
-            .zip(b)
-            .take_while(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
-            .count()
-    }
-
-    pub fn deduplicate_labels(&mut self) {
-        use std::collections::HashMap;
-
-        let mut label_map: HashMap<&[u8], u32> = HashMap::new();
-        let mut new_labels: Vec<u8> = Vec::new();
-
-        for (_, node) in self.nodes.iter_mut().enumerate() {
-            let label_start = node.label_start as usize;
-            let label_len = node.label_len() as usize;
-            let label_slice = &self.labels[label_start..label_start + label_len];
-
-            if let Some(&existing_offset) = label_map.get(label_slice) {
-                // Label already exists, update node to point to existing label
-                node.label_start = existing_offset;
-            } else {
-                // New label, add to new_labels and update mapping
-                let new_offset = new_labels.len() as u32;
-                new_labels.extend_from_slice(label_slice);
-                label_map.insert(label_slice, new_offset);
-                node.label_start = new_offset;
-            }
-        }
-
-        self.labels = new_labels;
+        (self.nodes.len() * mem::size_of::<CompactNode>()) + (self.labels.len())
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut data = Vec::new();
 
-        // Serialize nodes
         let node_count = self.nodes.len() as u32;
-        bytes.extend_from_slice(&node_count.to_le_bytes());
-        let node_bytes = unsafe {
+        data.extend_from_slice(&node_count.to_le_bytes());
+
+        let nodes_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 self.nodes.as_ptr() as *const u8,
-                self.nodes.len() * mem::size_of::<Node>(),
+                self.nodes.len() * mem::size_of::<CompactNode>(),
             )
         };
-        bytes.extend_from_slice(node_bytes);
+        data.extend_from_slice(nodes_bytes);
 
-        // Serialize labels
         let label_count = self.labels.len() as u32;
-        bytes.extend_from_slice(&label_count.to_le_bytes());
-        bytes.extend_from_slice(&self.labels);
+        data.extend_from_slice(&label_count.to_le_bytes());
+        data.extend_from_slice(self.labels);
 
-        dbg!(self.nodes.len());
-        dbg!(self.labels.len());
+        data
+    }
+}
 
-        bytes
+pub fn compress_labels(labels: &mut Vec<u8>, nodes: &mut Vec<CompactNode>) {
+    let total_nodes = nodes.len();
+    println!("Starting smart compression on {} nodes...", total_nodes);
+
+    let mut string_to_id = std::collections::HashMap::new();
+    let mut unique_strings = Vec::new();
+    let mut node_to_unique_id = vec![0usize; total_nodes];
+
+    for (i, node) in nodes.iter().enumerate() {
+        let start = node.label_start as usize;
+        let end = start + node.label_len() as usize;
+        let s = String::from_utf8_lossy(&labels[start..end]).to_string();
+
+        if let Some(&id) = string_to_id.get(&s) {
+            node_to_unique_id[i] = id;
+        } else {
+            let id = unique_strings.len();
+            string_to_id.insert(s.clone(), id);
+            unique_strings.push(s);
+            node_to_unique_id[i] = id;
+        }
     }
 
-    pub fn from_bytes(data: &[u8]) -> Self {
-        let mut cursor = std::io::Cursor::new(data);
+    let num_uniques = unique_strings.len();
+    println!("Reduced to {} unique strings. Continuing...", num_uniques);
 
-        // Deserialize nodes
-        let node_count = cursor.read_u32::<LittleEndian>().unwrap() as usize;
-        let mut nodes = Vec::with_capacity(node_count);
-        unsafe {
-            nodes.set_len(node_count);
+    let mut redirects: Vec<(usize, u32)> = (0..num_uniques).map(|i| (i, 0)).collect();
+    let mut is_active = vec![true; num_uniques];
+
+    let mut sorted_indices: Vec<usize> = (0..num_uniques).collect();
+    sorted_indices.sort_unstable_by(|&a, &b| unique_strings[a].cmp(&unique_strings[b]));
+
+    for i in 0..num_uniques - 1 {
+        let small_id = sorted_indices[i];
+        let large_id = sorted_indices[i + 1];
+
+        if unique_strings[large_id].starts_with(&unique_strings[small_id]) {
+            redirects[small_id] = (large_id, 0);
+            is_active[small_id] = false;
         }
-        let node_bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                nodes.as_mut_ptr() as *mut u8,
-                node_count * mem::size_of::<Node>(),
-            )
-        };
-        cursor.read_exact(node_bytes).unwrap();
-
-        // Deserialize labels
-        let label_count = cursor.read_u32::<LittleEndian>().unwrap() as usize;
-
-        let mut labels = Vec::with_capacity(label_count);
-        unsafe {
-            labels.set_len(label_count);
-        }
-        let label_bytes =
-            unsafe { std::slice::from_raw_parts_mut(labels.as_mut_ptr() as *mut u8, label_count) };
-        cursor.read_exact(label_bytes).unwrap();
-
-        Self { nodes, labels }
     }
 
-    pub fn compress(&mut self) {
-        let total_nodes = self.nodes.len();
-        println!("Starting smart compression on {} nodes...", total_nodes);
+    let mut active_indices: Vec<usize> = (0..num_uniques).filter(|&i| is_active[i]).collect();
+    active_indices.sort_unstable_by(|&a, &b| {
+        unique_strings[a]
+            .chars()
+            .rev()
+            .cmp(unique_strings[b].chars().rev())
+    });
 
-        // --- Step 1: Identify Unique Strings ---
-        // We map every node to a Unique ID so we can work with a smaller dataset.
-        // Map: String -> Unique_ID
-        let mut string_to_id = std::collections::HashMap::new();
-        let mut unique_strings = Vec::new();
-        // Vector mapping: Node_Index -> Unique_ID
-        let mut node_to_unique_id = vec![0usize; total_nodes];
+    for i in 0..active_indices.len() - 1 {
+        let small_id = active_indices[i];
+        let large_id = active_indices[i + 1];
 
-        for (i, node) in self.nodes.iter().enumerate() {
-            let start = node.label_start as usize;
-            let end = start + node.label_len() as usize;
-            let s = String::from_utf8_lossy(&self.labels[start..end]).to_string();
+        let s_small = &unique_strings[small_id];
+        let s_large = &unique_strings[large_id];
 
-            if let Some(&id) = string_to_id.get(&s) {
-                node_to_unique_id[i] = id;
-            } else {
-                let id = unique_strings.len();
-                string_to_id.insert(s.clone(), id);
-                unique_strings.push(s);
-                node_to_unique_id[i] = id;
-            }
+        if s_large
+            .chars()
+            .rev()
+            .zip(s_small.chars().rev())
+            .all(|(a, b)| a == b)
+        {
+            let offset = (s_large.len() - s_small.len()) as u32;
+            redirects[small_id] = (large_id, offset);
+            is_active[small_id] = false;
         }
-
-        let num_uniques = unique_strings.len();
-        println!("Reduced to {} unique strings. Continuing...", num_uniques);
-
-        // --- Redirect Table ---
-        // redirects[id] = (Target_ID, Offset)
-        // Initially, everyone points to themselves (Target = Self, Offset = 0).
-        let mut redirects: Vec<(usize, u32)> = (0..num_uniques).map(|i| (i, 0)).collect();
-        // Tracks if a string is still a "Root" (hasn't been merged into another).
-        let mut is_active = vec![true; num_uniques];
-
-        // --- Step 2: Prefix Filter ---
-        // Sort indices by string content. "Apple" comes before "ApplePie".
-        let mut sorted_indices: Vec<usize> = (0..num_uniques).collect();
-        sorted_indices.sort_unstable_by(|&a, &b| unique_strings[a].cmp(&unique_strings[b]));
-
-        let mut prefix_merges = 0;
-        for i in 0..num_uniques - 1 {
-            let small_id = sorted_indices[i];
-            let large_id = sorted_indices[i + 1];
-
-            // If Small is prefix of Large
-            if unique_strings[large_id].starts_with(&unique_strings[small_id]) {
-                // Merge Small -> Large
-                redirects[small_id] = (large_id, 0);
-                is_active[small_id] = false;
-                prefix_merges += 1;
-            }
-        }
-
-        // --- Step 3: Suffix Filter ---
-        // We only check items that survived the prefix pass.
-        let mut active_indices: Vec<usize> = (0..num_uniques).filter(|&i| is_active[i]).collect();
-
-        // Sort by Reversed String. "ana" comes before "ananab" (banana reversed).
-        active_indices.sort_unstable_by(|&a, &b| {
-            unique_strings[a].chars().rev().cmp(unique_strings[b].chars().rev())
-        });
-
-        let mut suffix_merges = 0;
-        for i in 0..active_indices.len() - 1 {
-            let small_id = active_indices[i];
-            let large_id = active_indices[i + 1];
-
-            let s_small = &unique_strings[small_id];
-            let s_large = &unique_strings[large_id];
-
-            // Check if small is suffix of large (by checking starts_with on reverse)
-            if s_large.chars().rev().zip(s_small.chars().rev()).all(|(a, b)| a == b) {
-                // Calculate offset in the forward string
-                // "ana" inside "banana". Offset = 6 - 3 = 3.
-                let offset = (s_large.len() - s_small.len()) as u32;
-
-                redirects[small_id] = (large_id, offset);
-                is_active[small_id] = false;
-                suffix_merges += 1;
-            }
-        }
-
-        // --- Step 4: Flatten Chains ---
-        // We resolve the chains (A -> B -> C) so everyone points to the Final Root.
-        // Map: Unique_ID -> (Final_Root_ID, Total_Offset)
-        let mut final_resolution: Vec<(usize, u32)> = vec![(0, 0); num_uniques];
-
-        for i in 0..num_uniques {
-            let mut curr = i;
-            let mut total_offset = 0;
-            let mut depth = 0;
-
-            // Follow the redirects until we hit a Root (active node pointing to self)
-            while !is_active[curr] {
-                let (next, off) = redirects[curr];
-                // Safety break for cycles (shouldn't happen)
-                if next == curr { break; } 
-                
-                total_offset += off;
-                curr = next;
-                
-                depth += 1;
-                if depth > 1000 { break; } // Prevent infinite loops
-            }
-            final_resolution[i] = (curr, total_offset);
-        }
-
-        // --- Step 5: Reconstruction ---
-        println!("Constructing super-buffer...");
-        
-        let mut super_buffer = Vec::new();
-        // Map: Unique_ID (of Roots) -> Absolute_Byte_Address_In_Buffer
-        let mut root_addresses = vec![0u32; num_uniques];
-
-        for i in 0..num_uniques {
-            // We only write Active Roots to the file
-            if is_active[i] {
-                let start_addr = super_buffer.len() as u32;
-                super_buffer.extend_from_slice(unique_strings[i].as_bytes());
-                root_addresses[i] = start_addr;
-            }
-        }
-
-        // --- Step 6: Update Nodes ---
-        println!("Updating pointers for {} nodes...", total_nodes);
-
-        for (i, node) in self.nodes.iter_mut().enumerate() {
-            let unique_id = node_to_unique_id[i];
-            
-            // 1. Where does this unique string live logically? (Root + Relative Offset)
-            let (root_id, relative_offset) = final_resolution[unique_id];
-            
-            // 2. Where is that Root physically located?
-            let absolute_base = root_addresses[root_id];
-            
-            // 3. Final Address
-            node.label_start = absolute_base + relative_offset;
-        }
-
-        self.labels = super_buffer;
-        println!("Smart compression complete. Final size: {} bytes.", self.labels.len());
     }
+
+    let mut final_resolution: Vec<(usize, u32)> = vec![(0, 0); num_uniques];
+
+    for i in 0..num_uniques {
+        let mut curr = i;
+        let mut total_offset = 0;
+        let mut depth = 0;
+
+        while !is_active[curr] {
+            let (next, off) = redirects[curr];
+            if next == curr {
+                break;
+            }
+            total_offset += off;
+            curr = next;
+            depth += 1;
+            if depth > 1000 {
+                break;
+            }
+        }
+        final_resolution[i] = (curr, total_offset);
+    }
+
+    println!("Constructing super-buffer...");
+
+    let mut super_buffer = Vec::new();
+    let mut root_addresses = vec![0u32; num_uniques];
+
+    for i in 0..num_uniques {
+        if is_active[i] {
+            let start_addr = super_buffer.len() as u32;
+            super_buffer.extend_from_slice(unique_strings[i].as_bytes());
+            root_addresses[i] = start_addr;
+        }
+    }
+
+    println!("Updating pointers for {} nodes...", total_nodes);
+
+    for (i, node) in nodes.iter_mut().enumerate() {
+        let unique_id = node_to_unique_id[i];
+        let (root_id, relative_offset) = final_resolution[unique_id];
+        let absolute_base = root_addresses[root_id];
+        node.label_start = absolute_base + relative_offset;
+    }
+
+    labels.clear();
+    labels.append(&mut super_buffer);
+    println!(
+        "Smart compression complete. Final size: {} bytes.",
+        labels.len()
+    );
+}
+
+// Helper to find length of common prefix
+fn common_prefix_len(s1: &[u8], s2: &[u8]) -> usize {
+    s1.iter().zip(s2).take_while(|(a, b)| a == b).count()
 }
 
 #[cfg(test)]
@@ -666,72 +632,93 @@ mod tests {
 
     #[test]
     fn test_basic_insertion_and_search() {
-        let mut trie = CompactPatriciaTrie::new();
-        trie.insert("apple");
-        trie.insert("app");
-        trie.insert("banana");
-        trie.insert("bandana");
+        let mut builder = TrieBuilder::new();
+        builder.insert("apple");
+        builder.insert("app");
+        builder.insert("banana");
+        builder.insert("bandana");
+
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
 
         assert!(trie.contains("apple"));
         assert!(trie.contains("app"));
         assert!(trie.contains("banana"));
         assert!(trie.contains("bandana"));
 
-        assert!(!trie.contains("ban")); // inserted implicitly as path, but not terminal
-        assert!(!trie.contains("apples")); // too long
-        assert!(!trie.contains("orange")); // missing
+        assert!(!trie.contains("ban"));
+        assert!(!trie.contains("apples"));
+        assert!(!trie.contains("orange"));
     }
 
     #[test]
     fn test_split_logic() {
-        let mut trie = CompactPatriciaTrie::new();
-        // Insert "test"
-        trie.insert("test");
-        // Insert "team" -> should split "test" into "te" -> ("st", "am")
-        trie.insert("team");
+        let mut builder = TrieBuilder::new();
+        builder.insert("test");
+        builder.insert("team");
+
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
 
         assert!(trie.contains("test"));
         assert!(trie.contains("team"));
-
-        // Internal check (whitebox)
-        // Root -> "te" (child)
-        // "te" -> "st" (child), "am" (sibling of "st")
-        let root_child = trie.nodes[0].first_child;
-        let lbl = trie.get_label(root_child);
-        assert_eq!(lbl, b"te");
     }
 
     #[test]
-    fn test_node_memory_layout() {
-        // Verify that Node is 12 bytes (3 u32s) instead of the original 16 bytes
-        assert_eq!(std::mem::size_of::<Node>(), 12);
+    fn test_compact_node_memory_layout() {
+        // Verify CompactNode is 8 bytes
+        assert_eq!(std::mem::size_of::<CompactNode>(), 8);
 
-        // Test packed field functionality
-        let mut node = Node::new(100, 200, 300, 50, true);
-
-        // Test getter methods
+        let node = CompactNode::new(100, 200, 50, true, true);
         assert_eq!(node.label_start, 100);
-        assert_eq!(node.first_child, 200);
-        assert_eq!(node.next_sibling(), 300);
+        assert_eq!(node.first_child(), 200);
         assert_eq!(node.label_len(), 50);
         assert_eq!(node.is_terminal(), true);
+        assert_eq!(node.has_next_sibling(), true);
+    }
 
-        // Test setter methods
-        node.set_next_sibling(400);
-        node.set_label_len(75);
-        node.set_is_terminal(false);
+    #[test]
+    fn test_empty_trie() {
+        let builder = TrieBuilder::new();
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
 
-        assert_eq!(node.next_sibling(), 400);
-        assert_eq!(node.label_len(), 75);
-        assert_eq!(node.is_terminal(), false);
+        assert!(!trie.contains(""));
+        assert!(!trie.contains("anything"));
 
-        // Test edge cases
-        node.set_next_sibling(0x00FFFFFF); // Max 24-bit value
-        node.set_label_len(127); // Max 7-bit value
-        node.set_is_terminal(true);
+        let suggestions = trie.suggest("test", 10);
+        assert_eq!(suggestions.len(), 0);
+    }
 
-        assert_eq!(node.next_sibling(), 0x00FFFFFF);
-        assert_eq!(node.label_len(), 127);
-        assert_eq!(node.is_terminal(), true);
+    #[test]
+    fn test_single_word() {
+        let mut builder = TrieBuilder::new();
+        builder.insert("hello");
+
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
+
+        assert!(trie.contains("hello"));
+        assert!(!trie.contains("hel"));
+        assert!(!trie.contains("hello world"));
+        assert!(!trie.contains(""));
+    }
+
+    #[test]
+    fn test_prefix_words() {
+        let mut builder = TrieBuilder::new();
+        builder.insert("a");
+        builder.insert("ab");
+        builder.insert("abc");
+        builder.insert("abcd");
+
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
+
+        assert!(trie.contains("a"));
+        assert!(trie.contains("ab"));
+        assert!(trie.contains("abc"));
+        assert!(trie.contains("abcd"));
+        assert!(!trie.contains("abcde"));
     }
 }
