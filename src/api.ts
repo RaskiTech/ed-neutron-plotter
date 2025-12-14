@@ -14,7 +14,7 @@ export interface Coords {
 async function getStarCoords(star: string): Promise<Vector3> {
   const apiUrl = "https://www.edsm.net/api-v1/system"
 
-  const response = await fetch(`${apiUrl}?systemName=${encodeURIComponent(star)}&showCoordinates=1`);
+  const response = await fetch(`${apiUrl}?systemName=${encodeURI(star)}&showCoordinates=1`);
 
   if (!response.ok) {
     throw new Error(`Error fetching star coordinates: ${response.statusText}`);

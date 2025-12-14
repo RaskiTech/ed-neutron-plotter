@@ -1,7 +1,11 @@
+import * as directionSvg from "./directions.svg";
+import styles from "./search.module.css";
+
 export interface SearchBoxOptions {
   onSearch?: (query: string) => void;
   onSuggest: (word: string) => string[];
-  placeholder?: string;
+  onClickRoute?: (word: string) => void;
+  placeholder: string;
   className?: string;
 }
 
@@ -9,81 +13,67 @@ export class SearchBox {
   private container: HTMLDivElement;
   private input: HTMLInputElement;
   private suggestionsContainer: HTMLDivElement;
+  private routeIcon: HTMLDivElement;
   private onSearchCallback?: (query: string) => void;
   private onSuggestCallback: (word: string) => string[];
+  private onClickRouteCallback?: (word: string) => void;
   private selectedIndex: number = -1;
   private suggestions: string[] = [];
 
   constructor(options: SearchBoxOptions) {
     this.onSearchCallback = options.onSearch;
     this.onSuggestCallback = options.onSuggest;
+    this.onClickRouteCallback = options.onClickRoute;
+
     // Create container
     this.container = document.createElement('div');
-    this.container.className = options.className || 'search-box-container';
-    this.container.style.cssText = `
-      position: fixed;
-      top: 20px;
-      left: 50%;
-      transform: translateX(-50%);
-      z-index: 1000;
-      pointer-events: auto;
-    `;
+    this.container.className = `${styles.container} ${options.className || ''}`.trim();
 
     // Create input
     this.input = document.createElement('input');
     this.input.type = 'text';
-    this.input.placeholder = options.placeholder || 'Search stars...';
-    this.input.className = 'search-box-input';
-    this.input.style.cssText = `
-      background: rgba(0, 0, 0, 0.7);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      border-radius: 25px;
-      padding: 12px 20px;
-      color: white;
-      font-size: 16px;
-      width: 300px;
-      outline: none;
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
-      transition: all 0.3s ease;
-      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-    `;
+    this.input.placeholder = options.placeholder;
+    this.input.className = styles.input;
 
-    // Add focus and blur effects
-    this.input.addEventListener('focus', () => {
-      this.input.style.background = 'rgba(0, 0, 0, 0.8)';
-      this.input.style.borderColor = 'rgba(255, 255, 255, 0.6)';
-      this.input.style.boxShadow = '0 6px 20px rgba(0, 0, 0, 0.3)';
-    });
+    // Create route icon
+    this.routeIcon = document.createElement('div');
+    this.routeIcon.className = styles.routeIcon;
 
-    this.input.addEventListener('blur', () => {
-      this.input.style.background = 'rgba(0, 0, 0, 0.7)';
-      this.input.style.borderColor = 'rgba(255, 255, 255, 0.3)';
-      this.input.style.boxShadow = '0 4px 15px rgba(0, 0, 0, 0.2)';
+    const iconImg = document.createElement('img');
+    iconImg.src = directionSvg.default;
+    this.routeIcon.appendChild(iconImg);
+    this.routeIcon.title = 'Find route to target';
+
+    // Route icon click handler
+    this.routeIcon.addEventListener('click', () => {
+      if (this.input.value.trim() && this.onClickRouteCallback) {
+        this.onClickRouteCallback(this.input.value);
+      }
     });
 
     // Create suggestions container
     this.suggestionsContainer = document.createElement('div');
-    this.suggestionsContainer.className = 'search-suggestions';
-    this.suggestionsContainer.style.cssText = `
-      position: absolute;
-      top: 100%;
-      left: 0;
-      right: 0;
-      background: rgba(0, 0, 0, 0.9);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      border-radius: 15px 15px;
-      max-height: 200px;
-      overflow-y: auto;
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
-      display: none;
-      z-index: 1001;
-    `;
+    this.suggestionsContainer.className = styles.suggestions;
 
-    // Add input functionality
+    this.setupEventListeners();
+
+    this.container.appendChild(this.input);
+    this.container.appendChild(this.routeIcon);
+    this.container.appendChild(this.suggestionsContainer);
+  }
+
+  private setupEventListeners(): void {
+    // Input functionality
     this.input.addEventListener('input', (e) => {
       const query = (e.target as HTMLInputElement).value;
+
+      // Show/hide route icon based on input
+      if (query.trim() && this.onClickRouteCallback) {
+        this.routeIcon.classList.add(styles.routeIconVisible);
+      } else {
+        this.routeIcon.classList.remove(styles.routeIconVisible);
+      }
+
       if (query.length >= 2) {
         const suggestions = this.onSuggestCallback(query);
         this.showSuggestions(suggestions);
@@ -92,6 +82,7 @@ export class SearchBox {
       }
     });
 
+    // Keyboard navigation
     this.input.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
@@ -132,9 +123,6 @@ export class SearchBox {
         this.hideSuggestions();
       }
     });
-
-    this.container.appendChild(this.input);
-    this.container.appendChild(this.suggestionsContainer);
   }
 
   private showSuggestions(suggestions: string[]): void {
@@ -149,16 +137,9 @@ export class SearchBox {
 
     suggestions.forEach((suggestion, index) => {
       const item = document.createElement('div');
-      item.className = 'suggestion-item';
+      item.className = styles.suggestionItem;
       item.textContent = suggestion;
       item.dataset.index = index.toString();
-      item.style.cssText = `
-        padding: 10px 20px;
-        color: white;
-        cursor: pointer;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-        transition: background-color 0.2s ease;
-      `;
 
       item.addEventListener('mouseenter', () => {
         this.selectedIndex = index;
@@ -176,24 +157,24 @@ export class SearchBox {
       this.suggestionsContainer.appendChild(item);
     });
 
-    this.suggestionsContainer.style.display = 'block';
+    this.suggestionsContainer.classList.add(styles.suggestionsVisible);
   }
 
   private updateSelection(): void {
-    const items = this.suggestionsContainer.querySelectorAll('.suggestion-item');
+    const items = this.suggestionsContainer.querySelectorAll(`.${styles.suggestionItem}`);
     items.forEach((item, index) => {
       const element = item as HTMLElement;
       if (index === this.selectedIndex) {
-        element.style.backgroundColor = 'rgba(255, 255, 255, 0.2)';
+        element.classList.add(styles.selected);
         element.scrollIntoView({ block: 'nearest' });
       } else {
-        element.style.backgroundColor = 'transparent';
+        element.classList.remove(styles.selected);
       }
     });
   }
 
   private hideSuggestions(): void {
-    this.suggestionsContainer.style.display = 'none';
+    this.suggestionsContainer.classList.remove(styles.suggestionsVisible);
     this.selectedIndex = -1;
     this.suggestions = [];
   }
@@ -214,6 +195,13 @@ export class SearchBox {
 
   public setValue(value: string): void {
     this.input.value = value;
+
+    // Update route icon visibility when setting value programmatically
+    if (value.trim() && this.onClickRouteCallback) {
+      this.routeIcon.classList.add(styles.routeIconVisible);
+    } else {
+      this.routeIcon.classList.remove(styles.routeIconVisible);
+    }
   }
 
   public focus(): void {

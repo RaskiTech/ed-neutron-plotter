@@ -96,7 +96,7 @@ export class Galaxy {
     this.stats.update()
     this.renderer.render(this.scene, this.camera)
 
-    if (this.currentPosition.distanceToSquared(this.targetPosition) > 0.01) {
+    if (this.currentPosition.distanceToSquared(this.targetPosition) > 0.0001) {
       this.currentPosition.lerp(this.targetPosition, 0.08)
       this.controls.target.copy(this.currentPosition)
       this.requestRenderIfNotRequested()
