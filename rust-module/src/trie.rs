@@ -721,4 +721,196 @@ mod tests {
         assert!(trie.contains("abcd"));
         assert!(!trie.contains("abcde"));
     }
+
+    #[test]
+    fn test_suggest_comprehensive() {
+        let mut builder = TrieBuilder::new();
+
+        // Insert words with common prefixes
+        builder.insert("apple");
+        builder.insert("application");
+        builder.insert("apply");
+        builder.insert("app");
+        builder.insert("appreciate");
+        builder.insert("banana");
+        builder.insert("bandana");
+        builder.insert("band");
+        builder.insert("test");
+        builder.insert("testing");
+        builder.insert("tester");
+        builder.insert("team");
+        builder.insert("tea");
+
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
+
+        // Test 1: Suggestions for "app" prefix
+        let suggestions = trie.suggest("app", 10);
+        assert_eq!(
+            suggestions.len(),
+            5,
+            "Should find 5 words starting with 'app'"
+        );
+        assert!(suggestions.contains(&"app".to_string()));
+        assert!(suggestions.contains(&"apple".to_string()));
+        assert!(suggestions.contains(&"application".to_string()));
+        assert!(suggestions.contains(&"apply".to_string()));
+        assert!(suggestions.contains(&"appreciate".to_string()));
+
+        // Test 2: Suggestions for "ban" prefix
+        let suggestions = trie.suggest("ban", 10);
+        assert_eq!(
+            suggestions.len(),
+            3,
+            "Should find 3 words starting with 'ban'"
+        );
+        assert!(suggestions.contains(&"banana".to_string()));
+        assert!(suggestions.contains(&"bandana".to_string()));
+        assert!(suggestions.contains(&"band".to_string()));
+
+        // Test 3: Suggestions for "te" prefix
+        let suggestions = trie.suggest("te", 10);
+        assert_eq!(
+            suggestions.len(),
+            5,
+            "Should find 5 words starting with 'te'"
+        );
+        assert!(suggestions.contains(&"test".to_string()));
+        assert!(suggestions.contains(&"testing".to_string()));
+        assert!(suggestions.contains(&"tester".to_string()));
+        assert!(suggestions.contains(&"team".to_string()));
+        assert!(suggestions.contains(&"tea".to_string()));
+
+        // Test 4: Limit suggestions count
+        let suggestions = trie.suggest("app", 2);
+        assert_eq!(suggestions.len(), 2, "Should limit to 2 suggestions");
+
+        // Test 5: Exact match that also has extensions
+        let suggestions = trie.suggest("test", 10);
+        assert!(
+            suggestions.len() >= 3,
+            "Should find 'test' and its extensions"
+        );
+        assert!(suggestions.contains(&"test".to_string()));
+        assert!(suggestions.contains(&"testing".to_string()));
+        assert!(suggestions.contains(&"tester".to_string()));
+
+        // Test 6: No matching prefix
+        let suggestions = trie.suggest("xyz", 10);
+        assert_eq!(
+            suggestions.len(),
+            0,
+            "Should find no suggestions for non-existent prefix"
+        );
+
+        // Test 7: Prefix that's longer than any word
+        let suggestions = trie.suggest("applicationextended", 10);
+        assert_eq!(
+            suggestions.len(),
+            0,
+            "Should find no suggestions for too-long prefix"
+        );
+
+        // Test 8: Single character prefix
+        let suggestions = trie.suggest("a", 10);
+        assert!(
+            suggestions.len() >= 5,
+            "Should find all words starting with 'a'"
+        );
+        assert!(suggestions.contains(&"app".to_string()));
+        assert!(suggestions.contains(&"apple".to_string()));
+
+        // Test 9: Empty prefix (edge case)
+        let suggestions = trie.suggest("", 5);
+        // Depending on implementation, this might return all words or none
+        // This test documents the behavior
+        assert!(
+            suggestions.len() <= 5,
+            "Should respect limit even for empty prefix"
+        );
+
+        // Test 10: Limit of 0
+        let suggestions = trie.suggest("app", 0);
+        assert_eq!(
+            suggestions.len(),
+            0,
+            "Should return no suggestions when limit is 0"
+        );
+
+        // Test 11: Prefix that matches exactly one word with no extensions
+        let suggestions = trie.suggest("banana", 10);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0], "banana");
+
+        // Test 12: Case sensitivity
+        let suggestions = trie.suggest("APP", 10);
+        assert_eq!(
+            suggestions.len(),
+            0,
+            "Should be case sensitive - no matches for uppercase"
+        );
+    }
+
+    #[test]
+    fn test_suggest_with_nested_prefixes() {
+        let mut builder = TrieBuilder::new();
+
+        // Create a scenario with nested prefix words
+        builder.insert("car");
+        builder.insert("card");
+        builder.insert("care");
+        builder.insert("career");
+        builder.insert("careful");
+        builder.insert("carefully");
+
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
+
+        // Test suggestions at different prefix levels
+        let suggestions = trie.suggest("car", 10);
+        assert_eq!(suggestions.len(), 6);
+        assert!(suggestions.contains(&"car".to_string()));
+        assert!(suggestions.contains(&"card".to_string()));
+        assert!(suggestions.contains(&"care".to_string()));
+        assert!(suggestions.contains(&"career".to_string()));
+        assert!(suggestions.contains(&"careful".to_string()));
+        assert!(suggestions.contains(&"carefully".to_string()));
+
+        let suggestions = trie.suggest("care", 10);
+        assert_eq!(suggestions.len(), 4);
+        assert!(suggestions.contains(&"care".to_string()));
+        assert!(suggestions.contains(&"career".to_string()));
+        assert!(suggestions.contains(&"careful".to_string()));
+        assert!(suggestions.contains(&"carefully".to_string()));
+
+        let suggestions = trie.suggest("careful", 10);
+        assert_eq!(suggestions.len(), 2);
+        assert!(suggestions.contains(&"careful".to_string()));
+        assert!(suggestions.contains(&"carefully".to_string()));
+    }
+
+    #[test]
+    fn test_suggest_with_special_characters() {
+        let mut builder = TrieBuilder::new();
+
+        builder.insert("hello-world");
+        builder.insert("hello-there");
+        builder.insert("hello_world");
+        builder.insert("hello.world");
+
+        let (nodes, labels) = builder.build();
+        let trie = CompactRadixTrie::new(&nodes, &labels);
+
+        let suggestions = trie.suggest("hello", 10);
+        assert_eq!(suggestions.len(), 4);
+        assert!(suggestions.contains(&"hello-world".to_string()));
+        assert!(suggestions.contains(&"hello-there".to_string()));
+        assert!(suggestions.contains(&"hello_world".to_string()));
+        assert!(suggestions.contains(&"hello.world".to_string()));
+
+        let suggestions = trie.suggest("hello-", 10);
+        assert_eq!(suggestions.len(), 2);
+        assert!(suggestions.contains(&"hello-world".to_string()));
+        assert!(suggestions.contains(&"hello-there".to_string()));
+    }
 }
