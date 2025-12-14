@@ -484,6 +484,152 @@ impl CompactPatriciaTrie {
 
         Self { nodes, labels }
     }
+
+    pub fn compress(&mut self) {
+        println!("Starting smart compression on {} nodes...", self.nodes.len());
+
+        // 1. Prepare entries: (String, Original_Node_ID)
+        let mut entries: Vec<(String, u32)> = self.nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                let start = node.label_start as usize;
+                let end = start + node.label_len() as usize;
+                let s = String::from_utf8_lossy(&self.labels[start..end]).to_string();
+                (s, i as u32)
+            })
+            .collect();
+
+        // 2. Sort lexicographically to find Prefixes
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // Create a lookup: Original_Node_ID -> Sorted_Index
+        let mut original_to_sorted = vec![0usize; entries.len()];
+        for (sorted_idx, (_, orig_id)) in entries.iter().enumerate() {
+            original_to_sorted[*orig_id as usize] = sorted_idx;
+        }
+
+        // 'parent' vector for Union-Find-like structure. 
+        // Initially, everyone is their own parent.
+        // We use this to chain merges: A->B, B->C, implies A->C.
+        let mut prefix_parent: Vec<usize> = (0..entries.len()).collect();
+
+        // 3. Prefix Pass
+        for i in 0..entries.len() - 1 {
+            let j = i + 1;
+            // If entries[i] is a prefix of entries[j]
+            if entries[j].0.starts_with(&entries[i].0) {
+                // i merges into j
+                prefix_parent[i] = j;
+            }
+        }
+        
+        println!("Prefix pass complete. Starting suffix pass...");
+
+        // 4. Suffix Pass
+        // We only care about nodes that are ROOTS of the prefix chains (parent[i] == i).
+        // Children (A inside AB) don't need to be suffix-checked, their parent (AB) does.
+        
+        // Structure: (ReversedString, Sorted_Index)
+        let mut reverse_entries: Vec<(String, usize)> = entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| prefix_parent[*i] == *i) // Only survivors
+            .map(|(i, (s, _))| (s.chars().rev().collect(), i))
+            .collect();
+
+        reverse_entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        // Suffix mapping: Index -> (Container_Index, Offset_In_Container)
+        // Default: (i, 0)
+        let mut suffix_map: Vec<(usize, u32)> = (0..entries.len())
+            .map(|i| (i, 0))
+            .collect();
+
+        for i in 0..reverse_entries.len() - 1 {
+            let j = i + 1;
+            let (rev_s_small, idx_small) = &reverse_entries[i];
+            let (rev_s_large, idx_large) = &reverse_entries[j];
+
+            // If small is prefix of large (in reverse) => small is suffix of large
+            if rev_s_large.starts_with(rev_s_small) {
+                // "banana" (6) vs "ana" (3). Offset = 3.
+                // In reversed land, "ananab" starts with "ana".
+                // The true offset in the forward string is len(large) - len(small).
+                
+                // Real lengths needed (reverse string len is same as forward)
+                let len_large = rev_s_large.len();
+                let len_small = rev_s_small.len();
+                let offset = (len_large - len_small) as u32;
+
+                // Mark that 'small' is inside 'large'
+                suffix_map[*idx_small] = (*idx_large, offset);
+            }
+        }
+
+        // 5. Reconstruction
+        let mut new_labels = Vec::new();
+        // Maps Sorted_Index -> Final_Byte_Address
+        // We use a specific value (u32::MAX) to indicate "Not Written Yet" for debugging safety
+        let mut final_offsets = vec![u32::MAX; entries.len()];
+
+        for i in 0..entries.len() {
+            // We only write string if:
+            // 1. It is a Prefix Root (prefix_parent[i] == i)
+            // 2. It is a Suffix Root (suffix_map[i].0 == i)
+            if prefix_parent[i] == i && suffix_map[i].0 == i {
+                let start = new_labels.len() as u32;
+                new_labels.extend_from_slice(entries[i].0.as_bytes());
+                final_offsets[i] = start;
+            }
+        }
+
+        println!("Reconstruction complete. Resolving pointers...");
+
+        // 6. Resolve Pointers
+        // Every node must find its place.
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            let mut curr = original_to_sorted[i];
+            let mut total_offset = 0;
+
+            // A. Walk up the Prefix Chain
+            // While I am inside a larger string, move up.
+            // Loop limit prevents infinite loops if logic bugs out, though DAG guarantees termination.
+            let mut depth = 0;
+            while prefix_parent[curr] != curr {
+                curr = prefix_parent[curr];
+                depth += 1;
+                if depth > 10_000_000 { println!("Doing safety break!"); break; } // Safety break
+            }
+            
+            // Note: In a prefix merge, the offset is always 0 relative to the start of the container.
+            // "ban" is at index 0 of "banana". So we don't add to total_offset here.
+
+            // B. Walk up the Suffix Chain
+            // Now 'curr' is the Prefix Root. Check if it's inside another suffix.
+            depth = 0;
+            while suffix_map[curr].0 != curr {
+                let (parent, offset) = suffix_map[curr];
+                total_offset += offset;
+                curr = parent;
+                depth += 1;
+                if depth > 10_000_000 { println!("Doing safety break!"); break; }
+            }
+
+            // C. Get the physical address of the Ultimate Container
+            if final_offsets[curr] == u32::MAX {
+                // This should mathematically not happen if logic is correct
+                eprintln!("Critical Logic Error: Node {} resolved to {} which has no offset.", i, curr);
+                // Fallback to avoid crash, point to 0
+                node.label_start = 0; 
+            } else {
+                node.label_start = final_offsets[curr] + total_offset;
+            }
+        }
+
+        self.labels = new_labels;
+        println!("Smart compression finished. New labels size: {} bytes", self.labels.len());
+    }
 }
 
 #[cfg(test)]

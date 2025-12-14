@@ -73,6 +73,7 @@ fn main() -> io::Result<()> {
 
             trie.insert(system.name.as_str());
         });
+    trie.compress();
 
     let out_dir = std::path::Path::new("../public/data");
     std::fs::create_dir_all(out_dir)?;
