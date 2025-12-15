@@ -24,4 +24,4 @@ dist-ssr
 *.sw?
 
 systems_neutron.json
-*.bin
+public/data/*.bin
