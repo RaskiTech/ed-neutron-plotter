@@ -426,15 +426,6 @@ impl<'a> CompactRadixTrie<'a> {
                 let child_label = self.get_label(child_idx);
                 let current_key_part = &prefix_bytes[key_cursor..];
                 let common_len = common_prefix_len(child_label, current_key_part);
-                
-                // Debug print
-                if prefix == "APP" {
-                     println!("Debug: child_idx={}, label='{}', key_part='{}', common={}", 
-                         child_idx, 
-                         String::from_utf8_lossy(child_label), 
-                         String::from_utf8_lossy(current_key_part), 
-                         common_len);
-                }
 
                 if common_len > 0 {
                     buffer.extend_from_slice(&child_label[..common_len]);
@@ -565,6 +556,96 @@ impl<'a> CompactRadixTrie<'a> {
         data.extend_from_slice(self.labels);
 
         data
+    }
+
+    pub fn analyze_stats(&self) {
+        let mut total_nodes = 0;
+        let mut leaf_nodes = 0;
+        let mut label_lengths = Vec::new();
+        let mut children_counts = Vec::new();
+
+        for i in 0..self.nodes.len() {
+            let node = &self.nodes[i];
+            total_nodes += 1;
+            if node.is_terminal() {
+                leaf_nodes += 1;
+            }
+            label_lengths.push(node.label_len() as usize);
+
+            let mut child_count = 0;
+            let mut child_idx = node.first_child();
+            if child_idx != COMPACT_NONE {
+                loop {
+                    child_count += 1;
+                    if self.nodes[child_idx as usize].has_next_sibling() {
+                         child_idx += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            children_counts.push(child_count);
+        }
+
+        println!("=== Trie Statistics ===");
+        println!("Total Nodes: {}", total_nodes);
+        println!("Leaf Nodes: {} ({:.2}%)", leaf_nodes, (leaf_nodes as f64 / total_nodes as f64) * 100.0);
+        
+        // Label Length Stats
+        let min_label = label_lengths.iter().min().unwrap_or(&0);
+        let max_label = label_lengths.iter().max().unwrap_or(&0);
+        let active_labels: Vec<&usize> = label_lengths.iter().filter(|&&l| l > 0).collect();
+        let avg_label = if !active_labels.is_empty() {
+             active_labels.iter().map(|&&l| l).sum::<usize>() as f64 / active_labels.len() as f64
+        } else { 0.0 };
+        
+        println!("Label Lengths: Min={}, Max={}, Avg(non-zero)={:.2}", min_label, max_label, avg_label);
+
+        // Label Length Distribution
+        let mut label_buckets = vec![0; 11]; // 0..10 and 10+
+        for &l in &label_lengths {
+            if l >= 10 {
+                label_buckets[10] += 1;
+            } else {
+                label_buckets[l] += 1;
+            }
+        }
+        println!("Label Length Distribution:");
+        for i in 0..10 {
+             if label_buckets[i] > 0 {
+                println!("  {}: {}", i, label_buckets[i]);
+            }
+        }
+        if label_buckets[10] > 0 {
+            println!("  10+: {}", label_buckets[10]);
+        }
+        
+        // Children Count Stats
+        let min_children = children_counts.iter().min().unwrap_or(&0);
+        let max_children = children_counts.iter().max().unwrap_or(&0);
+        let avg_children = children_counts.iter().sum::<usize>() as f64 / children_counts.len() as f64;
+        
+        println!("Children Per Node: Min={}, Max={}, Avg={:.2}", min_children, max_children, avg_children);
+
+        // Distribution buckets for children
+        let mut buckets = vec![0; 11]; // 0..9 and 10+
+        for &c in &children_counts {
+            if c >= 10 {
+                buckets[10] += 1;
+            } else {
+                buckets[c] += 1;
+            }
+        }
+        println!("Children amount Distribution:");
+        for i in 0..10 {
+            if buckets[i] > 0 {
+                println!("  {}: {}", i, buckets[i]);
+            }
+        }
+        if buckets[10] > 0 {
+            println!("  10+: {}", buckets[10]);
+        }
+        println!("=======================");
     }
 }
 
